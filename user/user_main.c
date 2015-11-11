@@ -10,7 +10,7 @@
 #define user_procTaskPrio        0
 #define user_procTaskQueueLen    1
 os_event_t    user_procTaskQueue[user_procTaskQueueLen];
-static volatile os_timer_t deauth_timer;
+static volatile os_timer_t packet_timer;
 
 // Channel to perform deauth
 uint8_t channel = 1;
@@ -78,7 +78,22 @@ struct sniffer_buf2{
     uint16_t len;
 };
 
-/* Creates a deauth packet.
+/* Prints a byte array
+ *
+ * buf -  reference to the data array to print from;
+ * start - the offset to start printing from, usually 0;
+ * len - the number of bytes to print;
+ */
+void ICACHE_FLASH_ATTR
+print_bytes(uint8_t *buf, uint16_t start, uint16_t len) {
+	int i;
+	for (i = start; i < len; i++) {
+		if (i > 0) os_printf(":");
+		os_printf("%02X", buf[i]);
+	}
+}
+
+/* Creates a packet.
  * 
  * buf - reference to the data array to write packet to;
  * client - MAC address of the client;
@@ -87,37 +102,49 @@ struct sniffer_buf2{
  * 
  * Returns: size of the packet
  */
-uint16_t deauth_packet(uint8_t *buf, uint8_t *client, uint8_t *ap, uint16_t seq)
+uint16_t create_packet(uint8_t *buf, uint8_t *client, uint8_t *ap, uint16_t seq)
 {
     int i=0;
-    
-    // Type: deauth
-    buf[0] = 0xC0;
+    // The first byte stores 3 pieces of data
+    // 4 bits for the subtype, 2 bits for the type, and 2 bits for the version
+    // management deauth: 1100 0000 = 0xC0
+    // data null: 0100 1000 = 0x48
+    // Type: data
+    // Subtype: null
+    buf[0] = 0x48;
+
+    // The second byte stores 8 frame control flags
+    // For more info see https://dalewifisec.wordpress.com/2014/05/17/the-to-ds-and-from-ds-fields/
     buf[1] = 0x00;
+
     // Duration 0 msec, will be re-written by ESP
     buf[2] = 0x00;
     buf[3] = 0x00;
+
     // Destination
     for (i=0; i<6; i++) buf[i+4] = client[i];
     // Sender
     for (i=0; i<6; i++) buf[i+10] = ap[i];
+    // BSS
     for (i=0; i<6; i++) buf[i+16] = ap[i];
-    // Seq_n
+
+    // Sequence number / fragment number
     buf[22] = seq % 0xFF;
     buf[23] = seq / 0xFF;
-    // Deauth reason
-    buf[24] = 1;
-    buf[25] = 0;
-    return 26;
+
+    return 24;
 }
 
-/* Sends deauth packets. */
-void deauth(void *arg)
+/* Sends packets. */
+void send_packet(void *arg)
 {
-    os_printf("\nSending deauth seq_n = %d ...\n", seq_n/0x10);
+    os_printf("\nSending packet seq_n = %d ...\n", seq_n/0x10);
     // Sequence number is increased by 16, see 802.11
-    uint16_t size = deauth_packet(packet_buffer, client, ap, seq_n+0x10);
-    wifi_send_pkt_freedom(packet_buffer, size, 0);
+    uint16_t size = create_packet(packet_buffer, client, ap, seq_n+0x10);
+    int result = wifi_send_pkt_freedom(packet_buffer, size, 0);
+    os_printf("%d = wifi_send_pkt_freedom(", result);
+    print_bytes(packet_buffer, 0, size);
+    os_printf(", %d, 0)\n", size);
 }
 
 /* Listens communication between AP and client */
@@ -139,6 +166,12 @@ promisc_cb(uint8_t *buf, uint16_t len)
     }
 }
 
+void  ICACHE_FLASH_ATTR
+callback_send_pkt_freedom(uint8 status)
+{
+    os_printf("[packet callback] %d\n", status);
+}
+
 void ICACHE_FLASH_ATTR
 sniffer_system_init_done(void)
 {
@@ -147,6 +180,8 @@ sniffer_system_init_done(void)
     wifi_promiscuous_enable(0);
     wifi_set_promiscuous_rx_cb(promisc_cb);
     wifi_promiscuous_enable(1);
+
+    os_printf("%d = wifi_register_send_pkt_freedom_cb()\n", wifi_register_send_pkt_freedom_cb(callback_send_pkt_freedom));
 }
 
 void ICACHE_FLASH_ATTR
@@ -158,10 +193,10 @@ user_init()
     // Promiscuous works only with station mode
     wifi_set_opmode(STATION_MODE);
     
-    // Set timer for deauth
-    os_timer_disarm(&deauth_timer);
-    os_timer_setfn(&deauth_timer, (os_timer_func_t *) deauth, NULL);
-    os_timer_arm(&deauth_timer, CHANNEL_HOP_INTERVAL, 1);
+    // Set timer for sending packets
+    os_timer_disarm(&packet_timer);
+    os_timer_setfn(&packet_timer, (os_timer_func_t *) send_packet, NULL);
+    os_timer_arm(&packet_timer, SEND_INTERVAL, 1);
     
     // Continue to 'sniffer_system_init_done'
     system_init_done_cb(sniffer_system_init_done);
